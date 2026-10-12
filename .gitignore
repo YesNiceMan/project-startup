@@ -1,0 +1,18 @@
+# WorkBuddy 工作区数据（本地记忆、临时脚本，不上传）
+.workbuddy/
+
+# Playwright CLI 调试快照
+.playwright-cli/
+
+# 面板运行时数据（首次启动自动重建）
+data/
+
+# 运行时产物
+panel.pid
+panel.log
+*.log
+
+# Node / 系统杂物
+node_modules/
+.DS_Store
+Thumbs.db
