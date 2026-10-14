@@ -118,16 +118,18 @@ function animateIn(els, baseDelay = 0, step = 55, dist = 16) {
   const list = [...els];
   if (!list.length) return;
   if (document.hidden || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  // 大列表收紧步长：错峰总时长封顶 ~0.6s，几十张卡片不再要等 2s+ 才全部可见
+  const st = list.length > 1 ? Math.min(step, 600 / (list.length - 1)) : 0;
   for (const el of list) {
     const i = list.indexOf(el);
     let anim;
     try {
       anim = el.animate(
         [{ opacity: 0, transform: `translateY(${dist}px)` }, { opacity: 1, transform: 'none' }],
-        { duration: 480, delay: baseDelay + i * step, easing: 'cubic-bezier(.22,1,.36,1)', fill: 'backwards' },
+        { duration: 480, delay: baseDelay + i * st, easing: 'cubic-bezier(.22,1,.36,1)', fill: 'backwards' },
       );
     } catch { return; }
-    setTimeout(() => { try { anim.finish(); } catch { /* already finished */ } }, baseDelay + i * step + 560);
+    setTimeout(() => { try { anim.finish(); } catch { /* already finished */ } }, baseDelay + i * st + 560);
   }
 }
 
@@ -200,7 +202,7 @@ const ACCENTS = [
   { id: 'mono', label: '石墨', dark: '#9aa8c0', rgb: [154, 168, 192], rgbL: [95, 113, 140] },
 ];
 let ACCENT_NOW = ACCENTS[0]; // 画布（灯笼/极光）实时读取的当前色板
-const accentRgbStr = (light) => (light ? ACCENT_NOW.rgbL : ACCENT_NOW).join(', ');
+const accentRgbStr = (light) => (light ? ACCENT_NOW.rgbL : ACCENT_NOW.rgb).join(', ');
 /** 应用色板：body[data-accent] 驱动 CSS 变量（靛蓝为默认，不挂属性）；favicon 待机色联动 */
 function applyAccent(id) {
   const a = ACCENTS.find((x) => x.id === id) || ACCENTS[0];
@@ -1651,7 +1653,7 @@ async function runScanInModal() {
     renderScanList(data);
     if (state.system) state.system.lastScanAt = Date.now();
     renderHeroSub();
-    toast(`扫描完成 · 发现 ${data.discovered} 个候选${data.added && data.added.length ? '，新增 ' + data.added.length + ' 个' : ''}`, 'ok');
+    toast(`扫描完成 · 发现 ${data.discovered} 个候选${data.added && data.added.length ? '，新增 ' + data.added.length + ' 个' : ''}${data.pruned ? '，清理根目录外 ' + data.pruned + ' 个' : ''}`, 'ok');
   } catch (err) { toast(err.message, 'err'); renderScanList('idle'); }
 }
 function renderScanList(data) {
@@ -1671,7 +1673,9 @@ $('#btn-scan').onclick = async (e) => {
   try {
     const data = await post('/api/scan', {});
     await refresh();
-    toast(data.added && data.added.length ? `发现并添加 ${data.added.length} 个新项目` : '扫描完成，没有新项目', 'ok');
+    toast(data.added && data.added.length
+      ? `发现并添加 ${data.added.length} 个新项目${data.pruned ? '，清理根目录外 ' + data.pruned + ' 个' : ''}`
+      : (data.pruned ? `扫描完成 · 清理根目录外 ${data.pruned} 个旧项目` : '扫描完成，没有新项目'), 'ok');
   } catch (err) { toast(err.message, 'err'); }
   b.classList.remove('loading');
 };
@@ -1707,7 +1711,7 @@ $('#set-basedir-btn').onclick = async () => {
     state.system.lastScanAt = Date.now();
     await refresh();
     renderScanList(data);
-    toast(`扫描完成 · 发现 ${data.discovered} 个候选${data.added && data.added.length ? '，新增 ' + data.added.length + ' 个' : ''}`, 'ok');
+    toast(`扫描完成 · 发现 ${data.discovered} 个候选${data.added && data.added.length ? '，新增 ' + data.added.length + ' 个' : ''}${data.pruned ? '，清理根目录外 ' + data.pruned + ' 个' : ''}`, 'ok');
   } catch (err) { toast(err.message, 'err'); }
   btn.disabled = false;
 };

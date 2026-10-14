@@ -13,7 +13,7 @@ const { spawn, spawnSync, execSync } = require('child_process');
 const crypto = require('crypto');
 
 const APP_NAME = 'LaunchPad · 项目启动面板';
-const APP_VERSION = '1.1.25';
+const APP_VERSION = '1.1.28';
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -81,19 +81,22 @@ const TOOL_CMDS = {
   node: 'node -v',
   npm: 'npm -v',
   python: 'python --version',
+  python3: 'python3 --version',
   pip: 'pip --version',
   java: 'java -version',
   maven: 'mvn -v',
   git: 'git --version',
   dotnet: 'dotnet --version',
 };
+// 探测输出是 shell 报错（命令不存在等）→ 视为未安装，避免把报错文本缓存成"版本号"
+const TOOL_FAIL_RE = /command not found|not recognized|unable to locate|no such file|operation not permitted/i;
 
 function detectTool(name) {
   if (toolCache[name] !== undefined) return toolCache[name];
   const cmd = TOOL_CMDS[name];
   if (!cmd) return (toolCache[name] = null);
   const grab = (text) => {
-    if (!text) return null;
+    if (!text || TOOL_FAIL_RE.test(String(text))) return null;
     const t = String(text).replace(/,/g, '.');
     const m = t.match(/(\d+\.\d+(\.\d+)?(_\d+)?)/);
     return m ? m[1] : (String(text).trim().split(/\r?\n/)[0] || null);
@@ -131,7 +134,7 @@ function detectToolAsync(name) {
   });
 }
 function grabVer(text) {
-  if (!text) return null;
+  if (!text || TOOL_FAIL_RE.test(String(text))) return null;
   const t = String(text).replace(/,/g, '.');
   const m = t.match(/(\d+\.\d+(\.\d+)?(_\d+)?)/);
   return m ? m[1] : (String(t).trim().split(/\r?\n/)[0] || null);
@@ -431,10 +434,16 @@ function suggestStaticPort(p) {
   return port;
 }
 
+/** 静态站点启动命令：python 缺失时回退 python3（现代 macOS 默认无裸 python 命令，否则启动即 127 崩溃） */
+function staticServeCmd(port) {
+  const bin = detectTool('python') ? 'python' : (detectTool('python3') ? 'python3' : 'python');
+  return `${bin} -m http.server ${port} --bind 0.0.0.0`;
+}
+
 function finalizeStatic(p) {
   p.port = p.port || suggestStaticPort(p);
-  p.runCmd = `python -m http.server ${p.port} --bind 0.0.0.0`;
-  p.requiredEnv = [{ tool: 'python', req: null }];
+  p.runCmd = staticServeCmd(p.port);
+  p.requiredEnv = [{ tool: p.runCmd.startsWith('python3') ? 'python3' : 'python', req: null }];
 }
 
 /* ---------------------------------------------------------------- discovery / scan */
@@ -442,7 +451,8 @@ function finalizeStatic(p) {
 function findProjectRoots(baseDir) {
   const found = [];
   let tops = [];
-  try { tops = fs.readdirSync(baseDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return found; }
+  // 顶层同样跳过隐藏目录：根目录设在用户主目录时，避免把 .Trash/.npm/.nvm/.cursor 等当项目扫进来
+  try { tops = fs.readdirSync(baseDir, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => d.name); } catch { return found; }
   for (const top of tops) {
     if (/^000-/.test(top)) continue; // 跳过工具目录
     const topAbs = path.join(baseDir, top);
@@ -474,6 +484,12 @@ function findProjectRoots(baseDir) {
 
 function stripPrefix(s) { return s.replace(/^(\d{3})-/, ''); }
 
+/** 是否位于当前根目录之外（含跨盘符的绝对路径） */
+function isOutsideBase(rootAbs) {
+  const rel = path.relative(path.resolve(config.baseDir), path.resolve(rootAbs));
+  return rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel);
+}
+
 /** 项目显示名：根目录下 → 目录名；嵌套 → 顶层名 · 末级名(不同时) */
 function projectNameFor(root) {
   const base = path.resolve(config.baseDir);
@@ -503,6 +519,7 @@ function registerProject(rootAbs, opts = {}) {
     title: '',
     desc: '',
     root,
+    manual: !!opts.manual, // 手动添加：即使位于根目录外也保留展示
     type: a.type,
     kind: a.kind,
     runCmd: a.runCmd,
@@ -522,6 +539,18 @@ function registerProject(rootAbs, opts = {}) {
   config.projects.push(proj);
   saveConfig();
   return proj;
+}
+
+/** 清理根目录外的扫描项目：切换根目录/重新扫描后，旧根目录扫进来的项目不再保留（手动添加的不受影响） */
+function pruneOutsideProjects() {
+  const stale = config.projects.filter((p) => !p.manual && isOutsideBase(p.root));
+  if (!stale.length) return 0;
+  for (const p of stale) { try { stopProject(p.id); } catch { /* ignore */ } }
+  const staleIds = new Set(stale.map((p) => p.id));
+  config.projects = config.projects.filter((p) => !staleIds.has(p.id));
+  saveConfig();
+  for (const p of stale) pushStatus(p.id); // 广播移除，前端即时清掉对应卡片
+  return stale.length;
 }
 
 /* ---------------------------------------------------------------- runtime management */
@@ -835,14 +864,16 @@ function startProject(id) {
       pushStatus(id);
     });
 
-    // 启动确认：1.5s 后仍存活 → running
-    setTimeout(() => {
-      if (rt.proc === child && rt.status === 'starting') {
-        rt.status = procAlive(child.pid) ? 'running' : 'crashed';
-        if (rt.status === 'crashed') appendLog(id, 'err', '进程启动后立即退出，请查看日志');
-        pushStatus(id);
-      }
-    }, 1500);
+    // 启动确认：500ms 存活即转 running（原固定等 1.5s，反馈偏慢）；死亡复检一次再判崩溃
+    const confirmStart = (delay, recheck) => setTimeout(() => {
+      if (rt.proc !== child || rt.status !== 'starting') return;
+      if (procAlive(child.pid)) { rt.status = 'running'; pushStatus(id); return; }
+      if (!recheck) { confirmStart(300, true); return; }
+      rt.status = 'crashed';
+      appendLog(id, 'err', '进程启动后立即退出，请查看日志');
+      pushStatus(id);
+    }, delay);
+    confirmStart(500, false);
   } catch (e) {
     rt.status = 'crashed';
     appendLog(id, 'err', '启动失败: ' + e.message);
@@ -867,15 +898,19 @@ function stopProject(id) {
     try { process.kill(-pid, 'SIGTERM'); }
     catch { try { process.kill(pid, 'SIGTERM'); } catch { try { rt.proc && rt.proc.kill('SIGTERM'); } catch { /* ignore */ } } }
   }
-  // 兜底：2.5s 后若还在则标记停止
-  setTimeout(() => {
-    if (rt.status === 'stopping') {
-      rt.status = 'stopped'; rt.proc = null; rt.pid = null;
-      const p = config.projects.find((x) => x.id === id);
-      if (p) { p.runtimePid = null; saveConfig(); }
-      pushStatus(id);
-    }
-  }, 2500);
+  // 停止确认：轮询进程消失即标记（接管型进程无 exit 管道，原固定等满 2.5s 偏慢）；2.5s 兜底
+  const markStopped = () => {
+    if (rt.status !== 'stopping') return;
+    rt.status = 'stopped'; rt.proc = null; rt.pid = null;
+    const p = config.projects.find((x) => x.id === id);
+    if (p) { p.runtimePid = null; saveConfig(); }
+    pushStatus(id);
+  };
+  const stopWatch = setInterval(() => {
+    if (rt.status !== 'stopping') { clearInterval(stopWatch); return; }
+    if (!pid || !procAlive(pid)) { clearInterval(stopWatch); markStopped(); }
+  }, 250);
+  setTimeout(() => { clearInterval(stopWatch); markStopped(); }, 2500);
   return { ok: true };
 }
 
@@ -883,7 +918,15 @@ function restartProject(id) {
   const rt = getRT(id, false);
   if (rt && (rt.status === 'running' || rt.status === 'starting')) {
     stopProject(id);
-    setTimeout(() => startProject(id), 1600);
+    // 停稳即启（原固定等 1.6s 偏慢）：轮询停止确认后稍作喘息再启动，3s 兜底强行启动
+    const t0 = Date.now();
+    const tryStart = () => {
+      const st = (getRT(id, false) || {}).status;
+      if (st === 'stopped' || st === 'crashed') { setTimeout(() => startProject(id), 200); return; }
+      if (Date.now() - t0 > 3000) { startProject(id); return; }
+      setTimeout(tryStart, 150);
+    };
+    tryStart();
     return { ok: true, restarting: true };
   }
   return startProject(id);
@@ -1090,7 +1133,8 @@ function projectPayload(p) {
 }
 
 function listProjects() {
-  return config.projects.map(projectPayload);
+  // 只展示当前根目录内的项目；手动添加的（可能在根目录外）始终保留
+  return config.projects.filter((p) => p.manual || !isOutsideBase(p.root)).map(projectPayload);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1161,13 +1205,15 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       if (body.baseDir && isDir(body.baseDir)) { config.baseDir = body.baseDir; saveConfig(); }
       const roots = findProjectRoots(config.baseDir);
+      const pruned = pruneOutsideProjects();
+      if (pruned) log(`已从列表清理 ${pruned} 个根目录之外的旧项目（根目录: ${config.baseDir}）`);
       const added = [];
       for (const r of roots) {
         const p = registerProject(r);
         if (p) added.push(p);
       }
       config.lastScanAt = Date.now(); saveConfig();
-      return send(res, 200, { added: added.map((p) => p.id), discovered: roots.length, projects: listProjects() });
+      return send(res, 200, { added: added.map((p) => p.id), discovered: roots.length, pruned, projects: listProjects() });
     }
     /* 批量操作 */
     if (u.pathname === '/api/batch' && req.method === 'POST') {
@@ -1262,7 +1308,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/projects' && req.method === 'POST') {
       const body = await readBody(req);
       if (!body.root || !isDir(body.root)) return send(res, 400, { error: '路径无效或目录不存在: ' + (body.root || '') });
-      const proj = registerProject(body.root, { name: body.name, force: true });
+      const proj = registerProject(body.root, { name: body.name, force: true, manual: true });
       if (!proj) return send(res, 400, { error: '未能识别该项目（缺少 package.json / requirements.txt / pom.xml / index.html 等，可先在详情中手填启动命令）' });
       config.lastScanAt = config.lastScanAt || null;
       return send(res, 200, { project: projectPayload(proj) });
@@ -1308,7 +1354,7 @@ const server = http.createServer(async (req, res) => {
         }
         if ('pinned' in body) p.pinned = !!body.pinned;
         if (p.type === 'static' && body.port && p.runCmd) {
-          p.runCmd = `python -m http.server ${p.port} --bind 0.0.0.0`;
+          p.runCmd = staticServeCmd(p.port);
         }
         saveConfig();
         pushStatus(id);
@@ -1374,6 +1420,18 @@ function pickPanelPort(port, tries = 12) {
     if (p.title === undefined || p.desc === undefined) {
       try { const a = analyzeProject(p.root); if (a) { if (p.title === undefined) p.title = a.title || ''; if (p.desc === undefined) p.desc = a.desc || ''; } } catch { /* ignore */ }
     }
+  }
+  // 静态项目自愈：python 不可用而 python3 可用时改写启动命令（现代 macOS 无裸 python，原命令启动即崩）
+  if (!detectTool('python') && detectTool('python3')) {
+    let healed = 0;
+    for (const p of config.projects) {
+      if (p.type === 'static' && /^python -m http\.server /.test(p.runCmd || '')) {
+        p.runCmd = `python3 -m http.server ${p.port} --bind 0.0.0.0`;
+        p.requiredEnv = [{ tool: 'python3', req: null }];
+        healed++;
+      }
+    }
+    if (healed) { saveConfig(); log(`静态项目自愈：${healed} 个启动命令已切换为 python3`); }
   }
   const port = await pickPanelPort(Number(config.port) || PANEL_PORT);
   config.port = port;
